@@ -1,0 +1,8 @@
+# Rust
+/target/
+
+# SECRETS / local state: never publish
+config.toml
+psk
+*.conf
+*.pcap

@@ -1,0 +1,23 @@
+# fuckforti configuration. Field names mirror FortiClient's IPsec VPN settings;
+# copy a working FortiClient config field by field. Save as config.toml.
+
+gateway        = "vpn.example.com"    # Remote Gateway  (<server>)
+saml_port      = 9443                 # SSO Port        (<ike_saml_port>)
+ike_port       = 4500                 # IKE UDP Port    (<udp_port>)
+local_id       = "MY-LOCAL-ID"        # Phase 1 Local ID (<localid>). If the gateway
+                                      # rejects the IKE ID, try "keyid:MY-LOCAL-ID".
+psk_file       = "psk"                # file with the plaintext PSK (or: psk = "...")
+
+# Phase 1 proposal (<proposal>AES256GCM|PRFSHA384</proposal> + DH group 20)
+ike_proposals  = ["aes256gcm16-prfsha384-ecp384"]
+ike_lifetime   = 43200                # <key_life>
+# Phase 2 proposal (AES256GCM, PFS DH group 20)
+esp_proposals  = ["aes256gcm16-ecp384"]
+child_lifetime = 3600
+
+# Routing. Empty = full tunnel (local LAN still reachable). For split tunnel, list
+# only the company subnets, e.g. ["10.0.0.0/8", "172.16.0.0/12"].
+split_routes   = []
+
+# DNS search domains resolved via the VPN DNS servers (<dns_suffix_list>).
+dns_domains    = []                   # e.g. ["corp.example.com"]

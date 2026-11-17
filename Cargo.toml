@@ -1,0 +1,19 @@
+[package]
+name = "fuckforti"
+version = "0.2.0"
+edition = "2021"
+description = "FortiGate IKEv2 IPsec dial-up VPN client for Linux with browser SAML/SSO login"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/flokol120/fuckforti"
+
+[dependencies]
+libc = "0.2"
+native-tls = "0.2"
+serde = { version = "1", features = ["derive"] }
+signal-hook = "0.3"
+toml = "0.8"
+
+[profile.release]
+lto = true
+strip = true
