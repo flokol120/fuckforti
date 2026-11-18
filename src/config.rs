@@ -1,5 +1,6 @@
-//! Configuration file handling (TOML).
+//! Configuration: from a TOML file (CLI) or from NetworkManager's vpn.data (service).
 
+use std::collections::HashMap;
 use std::fs;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
@@ -96,6 +97,55 @@ pub fn parse(text: &str, base: &Path) -> Result<Config> {
         }
         (None, None) => String::new(),
     };
+    validate(&cfg)?;
+    Ok(cfg)
+}
+
+/// Build a config from a NetworkManager connection's `vpn.data` / `vpn.secrets`.
+/// Keys are the TOML field names; list values are separated by spaces or `;`
+/// (nmcli uses `,` between key=value pairs).
+pub fn from_nm(data: &HashMap<String, String>, secrets: &HashMap<String, String>) -> Result<Config> {
+    fn num<T: std::str::FromStr>(k: &str, v: &str) -> Result<T> {
+        let v = v.strip_prefix("0x").map_or_else(|| v.parse().ok(), |hex| {
+            u64::from_str_radix(hex, 16).ok().and_then(|n| n.to_string().parse().ok())
+        });
+        v.map_or_else(|| err(format!("vpn.data {k}: not a valid number")), Ok)
+    }
+    fn list(v: &str) -> Vec<String> {
+        v.split(|c: char| c.is_whitespace() || c == ';' || c == ',').filter(|s| !s.is_empty()).map(String::from).collect()
+    }
+    let mut cfg = Config::default();
+    for (k, v) in data {
+        let v = v.trim();
+        match k.as_str() {
+            "gateway" => cfg.gateway = v.to_string(),
+            "local_id" => cfg.local_id = v.to_string(),
+            "saml_port" => cfg.saml_port = num(k, v)?,
+            "ike_port" => cfg.ike_port = num(k, v)?,
+            "redirect_port" => cfg.redirect_port = num(k, v)?,
+            "verify_tls" => {
+                cfg.verify_tls = match v {
+                    "yes" | "true" | "1" => true,
+                    "no" | "false" | "0" => false,
+                    _ => return err("vpn.data verify_tls: expected yes or no"),
+                }
+            }
+            "ike_proposals" => cfg.ike_proposals = list(v),
+            "esp_proposals" => cfg.esp_proposals = list(v),
+            "ike_lifetime" => cfg.ike_lifetime = num(k, v)?,
+            "child_lifetime" => cfg.child_lifetime = num(k, v)?,
+            "dpd_delay" => cfg.dpd_delay = num(k, v)?,
+            "ifname" => cfg.ifname = v.to_string(),
+            "if_id" => cfg.if_id = num(k, v)?,
+            "mtu" => cfg.mtu = num(k, v)?,
+            "split_routes" => cfg.split_routes = list(v),
+            "dns_domains" => cfg.dns_domains = list(v),
+            // secret flags (e.g. psk-flags) belong to NetworkManager
+            k if k.ends_with("-flags") => {}
+            _ => return err(format!("unknown vpn.data key {k:?}")),
+        }
+    }
+    cfg.psk = secrets.get("psk").map(|p| p.trim().to_string()).unwrap_or_default();
     validate(&cfg)?;
     Ok(cfg)
 }
@@ -200,6 +250,41 @@ pub(crate) mod tests {
             assert!(with(bad).is_err(), "accepted {bad}");
         }
         assert!(with(r#"split_routes = ["10.0.0.0/8"]"#).is_ok());
+    }
+
+    fn nm(pairs: &[(&str, &str)]) -> Result<Config> {
+        let mut data: HashMap<String, String> =
+            [("gateway", "vpn.example.com"), ("local_id", "ID"), ("psk-flags", "0")]
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+        data.extend(pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+        let secrets = HashMap::from([("psk".to_string(), "k".to_string())]);
+        from_nm(&data, &secrets)
+    }
+
+    #[test]
+    fn nm_data() {
+        let c = nm(&[
+            ("ike_port", "4500"),
+            ("split_routes", "10.0.0.0/8 172.16.0.0/12"),
+            ("dns_domains", "a.example;b.example"),
+            ("if_id", "0x10"),
+            ("verify_tls", "no"),
+        ])
+        .unwrap();
+        assert_eq!(c.ike_port, 4500);
+        assert_eq!(c.split_routes, ["10.0.0.0/8", "172.16.0.0/12"]);
+        assert_eq!(c.dns_domains, ["a.example", "b.example"]);
+        assert_eq!(c.if_id, 16);
+        assert!(!c.verify_tls);
+        assert_eq!(c.psk, "k");
+        assert_eq!(c.ike_proposals, Config::default().ike_proposals);
+
+        for bad in [("bogus", "1"), ("ike_port", "x"), ("ike_port", "70000"), ("split_routes", "10.0.0.1/8"), ("verify_tls", "maybe")] {
+            assert!(nm(&[bad]).is_err(), "accepted {bad:?}");
+        }
+        assert!(from_nm(&HashMap::from([("gateway".into(), "x".into()), ("local_id".into(), "I".into())]), &HashMap::new()).is_err());
     }
 
     #[test]

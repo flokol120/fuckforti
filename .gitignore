@@ -6,3 +6,5 @@ config.toml
 psk
 *.conf
 *.pcap
+# NetworkManager D-Bus policy (not a secret)
+!nm/*.conf

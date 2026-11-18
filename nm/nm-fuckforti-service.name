@@ -1,0 +1,5 @@
+[VPN Connection]
+name=fuckforti
+service=org.freedesktop.NetworkManager.fuckforti
+program=/usr/lib/fuckforti/nm-fuckforti-service
+supports-multiple-connections=false

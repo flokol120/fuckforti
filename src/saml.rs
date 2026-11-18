@@ -237,15 +237,47 @@ fn in_path(cmd: &str) -> bool {
 }
 
 /// Open URL in the invoking (non-root) user's browser when run via sudo.
-fn open_browser(url: &str) -> bool {
+pub fn open_browser(url: &str) -> bool {
+    let sudo_user = env::var("SUDO_USER").ok().filter(|u| !u.is_empty());
+    let as_user = sudo_user.filter(|_| unsafe { libc::geteuid() } == 0);
+    open_browser_as(as_user.as_deref(), url)
+}
+
+/// Owner of the active graphical session on seat0, from logind.
+fn active_session_user() -> Option<String> {
+    let value = |args: &[&str]| -> Option<String> {
+        let out = Command::new("loginctl").args(args).stderr(Stdio::null()).output().ok()?;
+        let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (out.status.success() && !v.is_empty()).then_some(v)
+    };
+    let session = value(&["show-seat", "seat0", "--property=ActiveSession", "--value"])?;
+    value(&["show-session", &session, "--property=Name", "--value"]).filter(|u| u != "root")
+}
+
+/// Open URL in the browser of whoever sits at the active graphical session.
+/// For a root service (NetworkManager plugin) that has no SUDO_USER and no display.
+pub fn open_browser_in_session(url: &str) -> bool {
+    let Some(user) = active_session_user() else { return false };
+    // The user's systemd manager has the session environment (WAYLAND_DISPLAY,
+    // DISPLAY, ...) imported by the desktop, so xdg-open runs as if they ran it.
+    let ok = Command::new("systemd-run")
+        .args(["--user", &format!("--machine={user}@.host"), "--collect", "--quiet", "--", "xdg-open", url])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|st| st.success());
+    ok || open_browser_as(Some(&user), url)
+}
+
+/// Run xdg-open, as `user` (from root) with a reconstructed session environment.
+fn open_browser_as(user: Option<&str>, url: &str) -> bool {
     if !in_path("xdg-open") {
         return false;
     }
-    let sudo_user = env::var("SUDO_USER").ok().filter(|u| !u.is_empty());
-    let euid = unsafe { libc::geteuid() };
-    let mut cmd = match sudo_user {
-        Some(user) if euid == 0 => {
-            let Ok(cname) = CString::new(user.as_str()) else { return false };
+    let mut cmd = match user {
+        Some(user) => {
+            let Ok(cname) = CString::new(user) else { return false };
             let pw = unsafe { libc::getpwnam(cname.as_ptr()) };
             if pw.is_null() {
                 return false;
@@ -267,10 +299,10 @@ fn open_browser(url: &str) -> bool {
                 envs.push(format!("WAYLAND_DISPLAY={wl}"));
             }
             let mut c = Command::new("runuser");
-            c.args(["-u", &user, "--", "env", "-i"]).args(&envs).args(["xdg-open", url]);
+            c.args(["-u", user, "--", "env", "-i"]).args(&envs).args(["xdg-open", url]);
             c
         }
-        _ => {
+        None => {
             let mut c = Command::new("xdg-open");
             c.arg(url);
             c
@@ -328,7 +360,7 @@ pub fn login(
     redirect_port: u16,
     verify_tls: bool,
     timeout: Duration,
-    browser: bool,
+    browser: Option<&dyn Fn(&str) -> bool>,
     stop: &AtomicBool,
 ) -> Result<SamlResult> {
     let listener = TcpListener::bind(("127.0.0.1", redirect_port))
@@ -338,7 +370,7 @@ pub fn login(
     let uid = new_uid();
     let url = request_login_url(gateway, saml_port, &uid, redirect_port, verify_tls)?;
     println!("Log in to the VPN in your browser:\n  {url}");
-    if browser && !open_browser(&url) {
+    if browser.is_some_and(|open| !open(&url)) {
         println!("(could not open a browser automatically; open the URL above manually)");
     }
 

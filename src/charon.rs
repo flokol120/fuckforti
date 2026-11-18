@@ -2,9 +2,11 @@
 //!
 //! The instance installs no routes, policies only match traffic on our XFRM
 //! interface (if_id), and DNS servers from mode-config are handed to
-//! systemd-resolved for that interface via the resolve plugin.
+//! systemd-resolved for that interface via the resolve plugin (or, under
+//! NetworkManager, written to a file that the service reports to NM).
 
 use std::fs;
+use std::net::Ipv4Addr;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -29,11 +31,20 @@ fn cerr<T>(msg: impl Into<String>) -> Result<T> {
     Err(Error::Charon(msg.into()))
 }
 
-pub fn strongswan_conf(cfg: &Config, rundir: &Path, debug: bool) -> String {
+/// `dns_file`: write received DNS servers to this file instead of calling resolvconf.
+pub fn strongswan_conf(cfg: &Config, rundir: &Path, debug: bool, dns_file: Option<&Path>) -> String {
     let lvl = if debug { 2 } else { 1 };
     let enc = if debug { 1 } else { 0 };
+    let resolve = match dns_file {
+        // charon runs `<path> -a|-d <iface>` and feeds "nameserver X" lines on stdin
+        // for every server; record the added ones instead of touching resolved.
+        Some(f) => format!(
+            "resolvconf {{\n                path = \"/bin/sh -c 'if [ $1 = -a ]; then cat >> {}; else cat >/dev/null; fi' fuckforti-dns\"\n            }}",
+            f.display()
+        ),
+        None => format!("resolvconf {{\n                iface = {}\n            }}", cfg.ifname),
+    };
     let rundir = rundir.display();
-    let ifname = &cfg.ifname;
     format!(
         r#"
 charon {{
@@ -46,9 +57,7 @@ charon {{
             socket = unix://{rundir}/charon.vici
         }}
         resolve {{
-            resolvconf {{
-                iface = {ifname}
-            }}
+            {resolve}
         }}
     }}
     filelog {{
@@ -118,6 +127,23 @@ pub struct Charon<'a> {
     sock_path: PathBuf,
     conf_path: PathBuf,
     pub log_path: PathBuf,
+    dns_file: Option<PathBuf>,
+}
+
+/// IPv4 `nameserver` entries of a resolv.conf-style file.
+pub fn parse_nameservers(text: &str) -> Vec<Ipv4Addr> {
+    let mut out: Vec<Ipv4Addr> = Vec::new();
+    let found = text
+        .lines()
+        .filter_map(|l| l.split('#').next()?.trim().strip_prefix("nameserver"))
+        .filter_map(|v| v.trim().parse().ok());
+    for ip in found {
+        // charon retries and may report a server more than once
+        if !out.contains(&ip) {
+            out.push(ip);
+        }
+    }
+    out
 }
 
 impl<'a> Charon<'a> {
@@ -130,7 +156,20 @@ impl<'a> Charon<'a> {
             sock_path: rundir.join("charon.vici"),
             conf_path: rundir.join("strongswan.conf"),
             log_path: rundir.join("charon.log"),
+            dns_file: None,
         }
+    }
+
+    /// Collect DNS servers in `path` instead of configuring systemd-resolved.
+    pub fn with_dns_file(mut self, path: PathBuf) -> Self {
+        self.dns_file = Some(path);
+        self
+    }
+
+    /// DNS servers received from the gateway (only with `with_dns_file`).
+    pub fn dns_servers(&self) -> Vec<Ipv4Addr> {
+        let Some(p) = &self.dns_file else { return Vec::new() };
+        fs::read_to_string(p).map(|t| parse_nameservers(&t)).unwrap_or_default()
     }
 
     pub fn started(&self) -> bool {
@@ -146,7 +185,7 @@ impl<'a> Charon<'a> {
             );
         }
         let rundir = self.conf_path.parent().unwrap();
-        fs::write(&self.conf_path, strongswan_conf(self.cfg, rundir, self.debug))
+        fs::write(&self.conf_path, strongswan_conf(self.cfg, rundir, self.debug, self.dns_file.as_deref()))
             .or_else(|e| cerr(format!("cannot write {}: {e}", self.conf_path.display())))?;
         let mut cmd = Command::new(CHARON);
         cmd.env_clear()
@@ -339,8 +378,18 @@ mod tests {
     #[test]
     fn conf_has_no_secret() {
         let c = base();
-        let conf = strongswan_conf(&c, Path::new("/run/x"), false);
+        let conf = strongswan_conf(&c, Path::new("/run/x"), false, None);
         assert!(conf.contains("socket = unix:///run/x/charon.vici"));
+        assert!(conf.contains("iface = forti0"));
         assert!(!conf.split_whitespace().any(|t| t == "k"));
+        let conf = strongswan_conf(&c, Path::new("/run/x"), false, Some(Path::new("/run/x/dns.conf")));
+        assert!(conf.contains("cat >> /run/x/dns.conf"));
+        assert!(!conf.contains("iface"));
+    }
+
+    #[test]
+    fn nameservers() {
+        let t = "# Generated\nnameserver 10.10.0.1   # by strongSwan\nnameserver 10.10.0.1\nnameserver 10.10.0.2\nnameserver fd00::1\nsearch x\n";
+        assert_eq!(parse_nameservers(t), [Ipv4Addr::new(10, 10, 0, 1), Ipv4Addr::new(10, 10, 0, 2)]);
     }
 }

@@ -1,26 +1,18 @@
 //! fuckforti: FortiGate IKEv2 + SAML VPN client for Linux (strongSwan backend).
 
-mod charon;
-mod config;
-mod error;
-mod net;
-mod saml;
-mod vici;
-
 use std::fs;
-use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use charon::Charon;
-use config::Config;
-use error::{Error, Result};
-use net::Tunnel;
+use fuckforti::charon::Charon;
+use fuckforti::config::{self, Config};
+use fuckforti::error::{Error, Result};
+use fuckforti::net::{self, Tunnel};
+use fuckforti::{lock_rundir, saml, shutdown, RUNDIR};
 
-const RUNDIR: &str = "/run/fuckforti";
 const KEPT_LOG: &str = "/tmp/fuckforti-charon.log";
 
 const USAGE: &str = "\
@@ -97,7 +89,7 @@ fn connect<'a>(
         cfg.redirect_port,
         cfg.verify_tls,
         Duration::from_secs(args.saml_timeout),
-        !args.no_browser,
+        (!args.no_browser).then_some(&saml::open_browser as &dyn Fn(&str) -> bool),
         stop,
     )?;
     match &res.username {
@@ -122,25 +114,6 @@ fn connect<'a>(
     println!("  dns:    {}", if dns.is_empty() { "(none pushed)".to_string() } else { dns.join(", ") });
     println!("Press Ctrl-C to disconnect.");
     charon.wait_down()
-}
-
-/// Create the run directory and take an exclusive lock on it for this process.
-fn lock_rundir(rundir: &Path) -> std::result::Result<fs::File, String> {
-    match fs::DirBuilder::new().mode(0o700).create(rundir) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            // A live charon socket means another session (possibly an older version) owns it.
-            if std::os::unix::net::UnixStream::connect(rundir.join("charon.vici")).is_ok() {
-                return Err(format!("another session is running ({RUNDIR}/charon.vici is live)"));
-            }
-        }
-        Err(e) => return Err(format!("cannot create {RUNDIR}: {e}")),
-    }
-    let f = fs::File::create(rundir.join("lock")).map_err(|e| format!("cannot create {RUNDIR}/lock: {e}"))?;
-    if unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&f), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        return Err("another fuckforti session is running".into());
-    }
-    Ok(f)
 }
 
 fn run() -> u8 {
@@ -211,16 +184,8 @@ fn run() -> u8 {
         }
     };
 
-    // Cleanup, in order: close the SA and wipe secrets, remove routes/link, stop charon.
     let ran_charon = charon.started();
-    if ran_charon {
-        charon.terminate();
-        charon.unload_secrets();
-    }
-    if let Some(t) = tunnel.as_mut() {
-        t.teardown();
-    }
-    charon.stop();
+    shutdown(&mut charon, tunnel.as_mut());
     if args.verbose && ran_charon && fs::copy(&charon.log_path, KEPT_LOG).is_ok() {
         println!("charon log kept at {KEPT_LOG}");
     }
