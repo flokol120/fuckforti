@@ -7,6 +7,9 @@
 //! The service does the SAML login (opening the browser in the active desktop
 //! session), runs the private charon and creates the XFRM interface. Addresses,
 //! routes and DNS are then applied by NetworkManager from the Ip4Config signal.
+//!
+//! With `vpn.persistent yes` a dropped tunnel is brought back while NetworkManager
+//! keeps the VPN active: first without, then with a new browser login.
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
@@ -25,7 +28,7 @@ use fuckforti::charon::Charon;
 use fuckforti::config::{self, parse_v4_net, Config};
 use fuckforti::error::{Error, Result};
 use fuckforti::net::{self, Tunnel};
-use fuckforti::{lock_rundir, saml, shutdown, RUNDIR};
+use fuckforti::{lock_rundir, monitor, saml, shutdown, Retry, Watch, RUNDIR};
 
 const BUS_NAME: &str = "org.freedesktop.NetworkManager.fuckforti";
 const PATH: &str = "/org/freedesktop/NetworkManager/VPN/Plugin";
@@ -63,6 +66,8 @@ struct Shared {
     state: AtomicU32,
     stop: Arc<AtomicBool>,
     worker: Mutex<Option<JoinHandle<()>>>,
+    /// Gateway and virtual IP last reported to NetworkManager.
+    vip: Mutex<Option<(Ipv4Addr, Ipv4Addr)>>,
 }
 
 impl Shared {
@@ -132,6 +137,15 @@ fn vpn_dict(settings: &Settings, key: &str) -> std::result::Result<HashMap<Strin
     HashMap::<String, String>::try_from(v).map_err(|e| VpnError::BadArguments(format!("vpn.{key}: {e}")))
 }
 
+/// `vpn.persistent`: keep the VPN up across outages.
+fn persistent(settings: &Settings) -> bool {
+    settings
+        .get("vpn")
+        .and_then(|v| v.get("persistent"))
+        .and_then(|v| bool::try_from(v.try_clone().ok()?).ok())
+        .unwrap_or(false)
+}
+
 fn connection_id(settings: &Settings) -> String {
     settings
         .get("connection")
@@ -141,14 +155,17 @@ fn connection_id(settings: &Settings) -> String {
 }
 
 /// Bring the tunnel up, report it to NetworkManager, and block until it goes down.
+/// Sets `up` once NetworkManager got the configuration. On a reconnect the
+/// interface (`tunnel`) is still there and is reused.
 fn bring_up<'a>(
     sh: &Shared,
     cfg: &'a Config,
     charon: &mut Charon<'a>,
     tunnel: &mut Option<Tunnel<'a>>,
+    up: &mut bool,
 ) -> Result<String> {
     let interrupted = || if sh.stop.load(Ordering::SeqCst) { Err(Error::Interrupted) } else { Ok(()) };
-    if net::link_exists(&cfg.ifname) {
+    if tunnel.is_none() && net::link_exists(&cfg.ifname) {
         return Err(Error::Net(format!("interface {} already exists: is another session running?", cfg.ifname)));
     }
     let gw_ip = net::resolve_gateway(&cfg.gateway)?;
@@ -170,7 +187,9 @@ fn bring_up<'a>(
     }
     interrupted()?;
 
-    tunnel.insert(Tunnel::new(cfg, &gw_ip)).create_link()?;
+    if tunnel.is_none() {
+        tunnel.insert(Tunnel::new(cfg, &gw_ip)).create_link()?;
+    }
     charon.start()?;
     charon.load(&res.uid, &res.token)?;
     println!("Negotiating IKEv2 with {}:{} ...", cfg.gateway, cfg.ike_port);
@@ -183,21 +202,78 @@ fn bring_up<'a>(
     sh.emit("Config", &(nm_config(cfg, gateway),));
     sh.emit("Ip4Config", &(nm_ip4_config(cfg, gateway, vip, &dns),));
     sh.set_state(STATE_STARTED);
-    let dns: Vec<String> = dns.iter().map(ToString::to_string).collect();
-    println!("Tunnel up: {} {vip}, dns: {}", cfg.ifname, if dns.is_empty() { "(none)".into() } else { dns.join(", ") });
-    charon.wait_down()
+    *up = true;
+    *sh.vip.lock().unwrap() = Some((gateway, vip));
+    let shown: Vec<String> = dns.iter().map(ToString::to_string).collect();
+    println!("Tunnel up: {} {vip}, dns: {}", cfg.ifname, if shown.is_empty() { "(none)".into() } else { shown.join(", ") });
+    monitor(charon, |w| {
+        if let Watch::Restored { vip, dns } = w {
+            let vip: Ipv4Addr = vip.parse().map_err(|_| Error::Charon(format!("bad virtual IP {vip}")))?;
+            sh.emit("Ip4Config", &(nm_ip4_config(cfg, gateway, vip, &dns),));
+            *sh.vip.lock().unwrap() = Some((gateway, vip));
+        }
+        Ok(())
+    })
+}
+
+/// While a full tunnel is being re-established, the default route and DNS
+/// point into a tunnel without SA, so the browser could not reach the identity
+/// provider. Hand NetworkManager a config without them until the tunnel is back.
+fn degrade(sh: &Shared, cfg: &Config) {
+    let Some((gateway, vip)) = *sh.vip.lock().unwrap() else { return };
+    if !cfg.full_tunnel() {
+        return; // keep company routes in the dead tunnel rather than leaking them
+    }
+    let mut m = nm_ip4_config(cfg, gateway, vip, &[]);
+    m.insert("never-default", Value::from(true));
+    m.remove("domains");
+    sh.emit("Ip4Config", &(m,));
 }
 
 /// The whole session on the worker thread: connect, wait, clean up.
-fn session(sh: Arc<Shared>, cfg: Config) {
+fn session(sh: Arc<Shared>, cfg: Config, persistent: bool) {
     let rundir = Path::new(RUNDIR);
     let lock = lock_rundir(rundir);
     let mut charon = Charon::new(&cfg, rundir, false, sh.stop.clone()).with_dns_file(rundir.join("dns.conf"));
     let mut tunnel: Option<Tunnel> = None;
+    let mut was_up = false;
+    let mut retry = Retry::new();
     let result = match &lock {
         Ok(_) => {
             let _ = std::fs::remove_file(&charon.log_path);
-            bring_up(&sh, &cfg, &mut charon, &mut tunnel)
+            loop {
+                let mut up = false;
+                let res = bring_up(&sh, &cfg, &mut charon, &mut tunnel, &mut up);
+                if up {
+                    was_up = true;
+                    retry.reset();
+                }
+                // Reconnect a dropped tunnel, or retry while the network is unreachable;
+                // not a failed or abandoned login.
+                let again = match &res {
+                    Ok(reason) => {
+                        println!("Tunnel lost: {reason}");
+                        true
+                    }
+                    Err(e @ Error::Net(_)) => {
+                        println!("error: {e}");
+                        true
+                    }
+                    Err(_) => false,
+                };
+                if !(again && was_up && persistent) {
+                    break res;
+                }
+                // Restart charon for a fresh login, but keep the interface:
+                // NetworkManager tracks the VPN by it.
+                shutdown(&mut charon, None);
+                degrade(&sh, &cfg);
+                match retry.wait(&sh.stop) {
+                    Ok(true) => {}
+                    Ok(false) => break res,
+                    Err(e) => break Err(e),
+                }
+            }
         }
         Err(e) => Err(Error::Net(e.clone())),
     };
@@ -246,10 +322,11 @@ impl Plugin {
         let data = vpn_dict(settings, "data")?;
         let secrets = vpn_dict(settings, "secrets")?;
         let cfg = config::from_nm(&data, &secrets).map_err(|e| VpnError::BadArguments(e.to_string()))?;
-        println!("Connecting {:?}", connection_id(settings));
+        let persistent = persistent(settings);
+        println!("Connecting {:?}{}", connection_id(settings), if persistent { " (persistent)" } else { "" });
         self.sh.set_state(STATE_STARTING);
         let sh = self.sh.clone();
-        *worker = Some(thread::spawn(move || session(sh, cfg)));
+        *worker = Some(thread::spawn(move || session(sh, cfg, persistent)));
         Ok(())
     }
 }
@@ -305,6 +382,7 @@ fn main() -> ExitCode {
         state: AtomicU32::new(STATE_STOPPED),
         stop: Arc::new(AtomicBool::new(false)),
         worker: Mutex::new(None),
+        vip: Mutex::new(None),
     });
     for sig in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM, signal_hook::consts::SIGHUP] {
         signal_hook::flag::register(sig, sh.stop.clone()).expect("installing signal handler");

@@ -45,13 +45,17 @@ pub fn strongswan_conf(cfg: &Config, rundir: &Path, debug: bool, dns_file: Optio
         None => format!("resolvconf {{\n                iface = {}\n            }}", cfg.ifname),
     };
     let rundir = rundir.display();
+    let tries = cfg.retransmit_tries;
+    let ifname = &cfg.ifname;
     format!(
         r#"
 charon {{
     load = {PLUGINS}
     install_routes = no
     install_virtual_ip = no
-    retransmit_tries = 3
+    retransmit_tries = {tries}
+    # never use the tunnel's own address for IKE (matters when MOBIKE roams)
+    interfaces_ignore = {ifname}
     plugins {{
         vici {{
             socket = unix://{rundir}/charon.vici
@@ -81,6 +85,10 @@ charon {{
     )
 }
 
+fn yes_no(b: bool) -> &'static str {
+    if b { "yes" } else { "no" }
+}
+
 fn secs(n: u64) -> String {
     format!("{n}s")
 }
@@ -104,9 +112,9 @@ pub fn connection(cfg: &Config, eap_id: &str) -> Msg {
         .kv("remote_port", cfg.ike_port.to_string())
         .list("proposals", &cfg.ike_proposals)
         .list("vips", ["0.0.0.0"])
-        .kv("encap", "no")
+        .kv("encap", yes_no(cfg.force_encap))
         .kv("fragmentation", "yes")
-        .kv("mobike", "no")
+        .kv("mobike", yes_no(cfg.mobike))
         .kv("send_certreq", "no")
         .kv("unique", "never")
         .kv("dpd_delay", secs(cfg.dpd_delay))
@@ -231,6 +239,11 @@ impl<'a> Charon<'a> {
         let _ = child.wait();
     }
 
+    /// Charon was started and is still running.
+    pub fn running(&mut self) -> bool {
+        self.child.is_some() && !self.exited()
+    }
+
     fn exited(&mut self) -> bool {
         self.child.as_mut().is_some_and(|c| !matches!(c.try_wait(), Ok(None)))
     }
@@ -274,6 +287,19 @@ impl<'a> Charon<'a> {
         })
     }
 
+    /// Bring the SA up again with the credentials charon still holds (no new
+    /// SAML login). Returns the virtual IP; on failure the attempt is aborted.
+    pub fn reinitiate(&self) -> Result<String> {
+        if let Some(p) = &self.dns_file {
+            let _ = fs::remove_file(p); // charon re-reports the servers of the new SA
+        }
+        let res = self.initiate(|m| println!("{m}")).and_then(|()| self.virtual_ip());
+        if res.is_err() {
+            self.terminate(); // initiate may time out while charon keeps retrying
+        }
+        res
+    }
+
     fn sa_info(&self, interruptible: bool) -> Result<Option<Msg>> {
         let mut s = self.session(interruptible)?;
         let mut found = None;
@@ -313,10 +339,12 @@ impl<'a> Charon<'a> {
     }
 
     /// Block until the IKE SA goes down. Returns a reason, or `Error::Interrupted`.
-    pub fn wait_down(&mut self) -> Result<String> {
+    /// `tick` runs about once per second.
+    pub fn wait_down(&mut self, mut tick: impl FnMut()) -> Result<String> {
         let mut s = self.session(true)?;
         s.register("ike-updown")?;
         loop {
+            tick();
             let ev = match s.next_event(Duration::from_secs(1)) {
                 Ok(ev) => ev,
                 Err(Error::Interrupted) => return Err(Error::Interrupted),
@@ -373,6 +401,8 @@ mod tests {
         assert_eq!(child.str("if_id_in"), Some(&b"0x4f46"[..]));
         assert_eq!(child.str("life_time"), Some(&b"3600s"[..]));
         assert_eq!(conn.str("rekey_time"), Some(&b"77760s"[..]));
+        assert_eq!(conn.str("mobike"), Some(&b"yes"[..]));
+        assert_eq!(conn.str("encap"), Some(&b"no"[..]));
     }
 
     #[test]
@@ -381,6 +411,8 @@ mod tests {
         let conf = strongswan_conf(&c, Path::new("/run/x"), false, None);
         assert!(conf.contains("socket = unix:///run/x/charon.vici"));
         assert!(conf.contains("iface = forti0"));
+        assert!(conf.contains("retransmit_tries = 5"));
+        assert!(conf.contains("interfaces_ignore = forti0"));
         assert!(!conf.split_whitespace().any(|t| t == "k"));
         let conf = strongswan_conf(&c, Path::new("/run/x"), false, Some(Path::new("/run/x/dns.conf")));
         assert!(conf.contains("cat >> /run/x/dns.conf"));

@@ -11,12 +11,12 @@ use fuckforti::charon::Charon;
 use fuckforti::config::{self, Config};
 use fuckforti::error::{Error, Result};
 use fuckforti::net::{self, Tunnel};
-use fuckforti::{lock_rundir, saml, shutdown, RUNDIR};
+use fuckforti::{lock_rundir, monitor, saml, shutdown, Retry, Watch, RUNDIR};
 
 const KEPT_LOG: &str = "/tmp/fuckforti-charon.log";
 
 const USAGE: &str = "\
-usage: fuckforti [-c CONFIG] [-v] [--no-browser] [--saml-timeout SECS]
+usage: fuckforti [-c CONFIG] [-v] [--no-browser] [--no-reconnect] [--saml-timeout SECS]
 
 FortiGate IKEv2 + SAML VPN client for Linux (strongSwan backend).
 
@@ -24,6 +24,7 @@ options:
   -c, --config PATH       config file (default: /etc/fuckforti/config.toml)
   -v, --verbose           verbose IKE logging
       --no-browser        only print the SAML login URL
+      --no-reconnect      exit when the tunnel drops instead of logging in again
       --saml-timeout SECS seconds to wait for the browser login (default: 300)
   -h, --help              show this help";
 
@@ -31,6 +32,7 @@ struct Args {
     config: PathBuf,
     verbose: bool,
     no_browser: bool,
+    reconnect: bool,
     saml_timeout: u64,
 }
 
@@ -39,6 +41,7 @@ fn parse_args() -> std::result::Result<Args, String> {
         config: "/etc/fuckforti/config.toml".into(),
         verbose: false,
         no_browser: false,
+        reconnect: true,
         saml_timeout: 300,
     };
     let mut it = std::env::args().skip(1);
@@ -52,6 +55,7 @@ fn parse_args() -> std::result::Result<Args, String> {
             "-c" | "--config" => a.config = value(&flag)?.into(),
             "-v" | "--verbose" => a.verbose = true,
             "--no-browser" => a.no_browser = true,
+            "--no-reconnect" => a.reconnect = false,
             "--saml-timeout" => {
                 a.saml_timeout = value(&flag)?.parse().map_err(|_| "--saml-timeout needs a number of seconds")?
             }
@@ -74,12 +78,14 @@ fn interrupted(stop: &AtomicBool) -> Result<()> {
 }
 
 /// Bring the tunnel up and block until it goes down. Returns why it went down.
+/// Sets `up` once the tunnel is established.
 fn connect<'a>(
     cfg: &'a Config,
     args: &Args,
     stop: &AtomicBool,
     charon: &mut Charon<'a>,
     tunnel: &mut Option<Tunnel<'a>>,
+    up: &mut bool,
 ) -> Result<String> {
     let gw_ip = net::resolve_gateway(&cfg.gateway)?;
     println!("Gateway {} ({gw_ip})", cfg.gateway);
@@ -104,16 +110,29 @@ fn connect<'a>(
     charon.load(&res.uid, &res.token)?;
     println!("Negotiating IKEv2 with {}:{} ...", cfg.gateway, cfg.ike_port);
     charon.initiate(|m| println!("{m}"))?;
-    let vip = charon.virtual_ip()?;
+    let mut vip = charon.virtual_ip()?;
     interrupted(stop)?;
     let routes = t.configure(&vip)?;
+    *up = true;
     println!("Tunnel up: {} {vip}", cfg.ifname);
     let note = if cfg.full_tunnel() { "  (full tunnel, local LAN excluded)" } else { "" };
     println!("  routes: {}{note}", routes.join(", "));
     let dns = t.dns_servers();
     println!("  dns:    {}", if dns.is_empty() { "(none pushed)".to_string() } else { dns.join(", ") });
     println!("Press Ctrl-C to disconnect.");
-    charon.wait_down()
+    monitor(charon, |w| match w {
+        Watch::Tick => {
+            t.refresh_host_route();
+            Ok(())
+        }
+        Watch::Restored { vip: new, .. } if new != vip => {
+            println!("New virtual IP {new}");
+            t.configure(new)?;
+            vip = new.to_string();
+            Ok(())
+        }
+        Watch::Restored { .. } => Ok(()),
+    })
 }
 
 fn run() -> u8 {
@@ -163,28 +182,57 @@ fn run() -> u8 {
     let mut charon = Charon::new(&cfg, rundir, args.verbose, stop.clone());
     let _ = fs::remove_file(&charon.log_path); // left over from a crashed session
     let mut tunnel: Option<Tunnel> = None;
-    let rc = match connect(&cfg, &args, &stop, &mut charon, &mut tunnel) {
-        Ok(reason) => {
-            println!("Disconnected: {reason}");
-            1
+    let mut ran_charon = false;
+    let mut was_up = false; // reconnect only sessions that worked once
+    let mut retry = Retry::new();
+    let rc = loop {
+        let mut up = false;
+        let res = connect(&cfg, &args, &stop, &mut charon, &mut tunnel, &mut up);
+        ran_charon |= charon.started();
+        if up {
+            was_up = true;
+            retry.reset();
         }
-        Err(Error::Interrupted) => {
-            println!("\nDisconnecting ...");
-            0
-        }
-        Err(e) => {
-            println!("error: {e}");
-            if matches!(e, Error::Charon(_)) {
-                let tail = charon.tail_log(25);
-                if !tail.is_empty() {
-                    println!("---- charon log (tail) ----\n{tail}");
-                }
+        // Only a dropped tunnel or an unreachable network are worth another
+        // login; a failed or abandoned login, or an IKE error, are not.
+        let again = match res {
+            Ok(reason) => {
+                println!("Disconnected: {reason}");
+                true
             }
-            1
+            Err(Error::Interrupted) => {
+                println!("\nDisconnecting ...");
+                break 0;
+            }
+            Err(e) => {
+                println!("error: {e}");
+                if matches!(e, Error::Charon(_)) {
+                    let tail = charon.tail_log(25);
+                    if !tail.is_empty() {
+                        println!("---- charon log (tail) ----\n{tail}");
+                    }
+                }
+                matches!(e, Error::Net(_))
+            }
+        };
+        if !(again && was_up && args.reconnect) {
+            break 1;
+        }
+        shutdown(&mut charon, tunnel.as_mut());
+        tunnel = None;
+        match retry.wait(&stop) {
+            Ok(true) => {}
+            Ok(false) => {
+                println!("Giving up: could not reconnect.");
+                break 1;
+            }
+            Err(_) => {
+                println!("\nDisconnecting ...");
+                break 0;
+            }
         }
     };
 
-    let ran_charon = charon.started();
     shutdown(&mut charon, tunnel.as_mut());
     if args.verbose && ran_charon && fs::copy(&charon.log_path, KEPT_LOG).is_ok() {
         println!("charon log kept at {KEPT_LOG}");

@@ -29,6 +29,13 @@ pub struct Config {
     pub ike_lifetime: u64,
     pub child_lifetime: u64,
     pub dpd_delay: u64,
+    /// IKE retransmissions before charon declares the peer dead (strongSwan
+    /// timeout 4 s, factor 1.8: 5 tries = ~165 s of outage tolerated).
+    pub retransmit_tries: u32,
+    /// MOBIKE (RFC 4555): move the SA to a new local address instead of dropping it.
+    pub mobike: bool,
+    /// Always UDP-encapsulate ESP, even without NAT (for networks that drop raw ESP).
+    pub force_encap: bool,
     pub ifname: String,
     pub if_id: u32,
     pub mtu: u32,
@@ -56,6 +63,9 @@ impl Default for Config {
             ike_lifetime: 86400,
             child_lifetime: 3600,
             dpd_delay: 20,
+            retransmit_tries: 5,
+            mobike: true,
+            force_encap: false,
             ifname: "forti0".into(),
             if_id: 0x4F46,
             mtu: 1400,
@@ -111,6 +121,13 @@ pub fn from_nm(data: &HashMap<String, String>, secrets: &HashMap<String, String>
         });
         v.map_or_else(|| err(format!("vpn.data {k}: not a valid number")), Ok)
     }
+    fn flag(k: &str, v: &str) -> Result<bool> {
+        match v {
+            "yes" | "true" | "1" => Ok(true),
+            "no" | "false" | "0" => Ok(false),
+            _ => err(format!("vpn.data {k}: expected yes or no")),
+        }
+    }
     fn list(v: &str) -> Vec<String> {
         v.split(|c: char| c.is_whitespace() || c == ';' || c == ',').filter(|s| !s.is_empty()).map(String::from).collect()
     }
@@ -123,13 +140,10 @@ pub fn from_nm(data: &HashMap<String, String>, secrets: &HashMap<String, String>
             "saml_port" => cfg.saml_port = num(k, v)?,
             "ike_port" => cfg.ike_port = num(k, v)?,
             "redirect_port" => cfg.redirect_port = num(k, v)?,
-            "verify_tls" => {
-                cfg.verify_tls = match v {
-                    "yes" | "true" | "1" => true,
-                    "no" | "false" | "0" => false,
-                    _ => return err("vpn.data verify_tls: expected yes or no"),
-                }
-            }
+            "verify_tls" => cfg.verify_tls = flag(k, v)?,
+            "mobike" => cfg.mobike = flag(k, v)?,
+            "force_encap" => cfg.force_encap = flag(k, v)?,
+            "retransmit_tries" => cfg.retransmit_tries = num(k, v)?,
             "ike_proposals" => cfg.ike_proposals = list(v),
             "esp_proposals" => cfg.esp_proposals = list(v),
             "ike_lifetime" => cfg.ike_lifetime = num(k, v)?,
@@ -197,6 +211,9 @@ fn validate(cfg: &Config) -> Result<()> {
             return err(format!("invalid DNS domain {d:?}"));
         }
     }
+    if !(1..=15).contains(&cfg.retransmit_tries) {
+        return err("'retransmit_tries' must be between 1 and 15");
+    }
     if cfg.ike_proposals.is_empty() || cfg.esp_proposals.is_empty() {
         return err("proposal lists must not be empty");
     }
@@ -232,6 +249,8 @@ pub(crate) mod tests {
         assert!(c.full_tunnel());
         assert_eq!(c.ike_proposals, ["aes256gcm16-prfsha384-ecp384"]);
         assert_eq!(c.psk, "k");
+        assert!(c.mobike && !c.force_encap);
+        assert_eq!(c.retransmit_tries, 5);
     }
 
     #[test]
@@ -246,6 +265,7 @@ pub(crate) mod tests {
             r#"saml_port = 0"#,
             r#"psk_file = "psk""#,
             r#"dns_domains = ["a b"]"#,
+            r#"retransmit_tries = 0"#,
         ] {
             assert!(with(bad).is_err(), "accepted {bad}");
         }
@@ -271,6 +291,8 @@ pub(crate) mod tests {
             ("dns_domains", "a.example;b.example"),
             ("if_id", "0x10"),
             ("verify_tls", "no"),
+            ("mobike", "no"),
+            ("retransmit_tries", "8"),
         ])
         .unwrap();
         assert_eq!(c.ike_port, 4500);
@@ -278,6 +300,8 @@ pub(crate) mod tests {
         assert_eq!(c.dns_domains, ["a.example", "b.example"]);
         assert_eq!(c.if_id, 16);
         assert!(!c.verify_tls);
+        assert!(!c.mobike && !c.force_encap);
+        assert_eq!(c.retransmit_tries, 8);
         assert_eq!(c.psk, "k");
         assert_eq!(c.ike_proposals, Config::default().ike_proposals);
 

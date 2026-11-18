@@ -182,7 +182,8 @@ fn parse_response(raw: &[u8]) -> Option<(u16, Vec<u8>)> {
 /// the literal trailing `?`, which URL-normalizing HTTP clients drop.
 fn request_login_url(gateway: &str, port: u16, uid: &str, redirect_port: u16, verify_tls: bool) -> Result<String> {
     let endpoint = format!("https://{gateway}:{port}");
-    let fail = |what: &str, e: &dyn std::fmt::Display| Error::Saml(format!("cannot reach SAML endpoint {endpoint}: {what}: {e}"));
+    // Error::Net: the gateway is unreachable, which a reconnect may retry.
+    let fail = |what: &str, e: &dyn std::fmt::Display| Error::Net(format!("cannot reach SAML endpoint {endpoint}: {what}: {e}"));
     let timeout = Duration::from_secs(15);
 
     let addr = (gateway, port)

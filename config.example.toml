@@ -21,3 +21,10 @@ split_routes   = []
 
 # DNS search domains resolved via the VPN DNS servers (<dns_suffix_list>).
 dns_domains    = []                   # e.g. ["corp.example.com"]
+
+# Outages and roaming (defaults shown).
+# retransmit_tries = 5               # IKE retries before the gateway counts as dead:
+#                                    # ~165 s of outage are bridged without reconnecting
+# mobike         = true              # keep the tunnel when the local IP changes
+#                                    # (Wi-Fi <-> Ethernet), if the gateway supports MOBIKE
+# force_encap    = false             # always wrap ESP in UDP (networks that drop raw ESP)

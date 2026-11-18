@@ -58,6 +58,26 @@ nmcli connection up forti            # logs: journalctl -u NetworkManager -f
 root can read it, in `/etc/NetworkManager/system-connections/`. `vpn.timeout 300`
 gives the browser login time to finish, since NetworkManager's default is 60 s.
 
+## Outages and reconnecting
+When the connection drops, the client goes through these stages until one works:
+
+1. **Short outages** (by default up to about 3 minutes, set with `retransmit_tries`):
+   the SAs survive and traffic resumes. DPD notices silence after `dpd_delay` seconds.
+2. **Network change** (Wi-Fi ↔ Ethernet, new DHCP lease): with MOBIKE (`mobike = true`,
+   used only if the gateway offers it) the SA moves to the new address. In full-tunnel
+   mode the CLI keeps its host route to the gateway on the current uplink.
+3. **SA lost**: the client first tries a new IKE SA with the existing login token, so no
+   browser is needed if the gateway accepts it.
+4. **New login**: the browser opens again. If the gateway can't be reached, for example
+   right after resume, it retries with backoff (2 s up to 60 s) and gives up after 15
+   minutes. It does not retry after a cancelled or timed-out login.
+
+The CLI reconnects by default (`--no-reconnect` turns that off). Under NetworkManager,
+stages 3 and 4 run only with `vpn.persistent yes`
+(`nmcli connection modify forti vpn.persistent yes`). The VPN then stays active in
+NetworkManager the whole time. In full-tunnel mode the default route and DNS are
+withdrawn during the new login, so the identity provider stays reachable.
+
 ## Recovering the pre-shared key
 The gateway authenticates with a shared PSK that FortiClient stores obfuscated in its
 config. If you don't have the plaintext, ask whoever administers the FortiGate, or read
