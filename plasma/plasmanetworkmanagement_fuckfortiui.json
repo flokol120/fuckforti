@@ -1,0 +1,11 @@
+{
+    "KPlugin": {
+        "Category": "VPNService",
+        "Description": "FortiGate IKEv2 IPsec with SAML/SSO login",
+        "EnabledByDefault": false,
+        "License": "MIT",
+        "Name": "FortiGate IPsec SAML (fuckforti)",
+        "Version": "0.1"
+    },
+    "X-NetworkManager-Services": "org.freedesktop.NetworkManager.fuckforti"
+}

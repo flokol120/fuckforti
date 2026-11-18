@@ -1,0 +1,14 @@
+post_install() {
+  cat <<'MSG'
+==> fuckforti: create a VPN profile with nmcli (see /usr/share/doc/fuckforti/README.md):
+      nmcli connection add type vpn con-name forti ifname '*' \
+        vpn-type org.freedesktop.NetworkManager.fuckforti vpn.timeout 300 \
+        vpn.data 'gateway=..., saml_port=..., ike_port=..., local_id=...' vpn.secrets 'psk=...'
+    If NetworkManager does not know the VPN type yet: systemctl restart NetworkManager
+    The system strongswan service must not be running.
+MSG
+}
+
+post_upgrade() {
+  echo "==> fuckforti: reconnect running VPN sessions to use the new version"
+}

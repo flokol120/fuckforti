@@ -1,0 +1,59 @@
+# Maintainer: Flo Dörr
+pkgbase=fuckforti
+pkgname=(fuckforti fuckforti-plasma)
+pkgver=0.2.0
+pkgrel=1
+pkgdesc='FortiGate IKEv2 IPsec VPN client with browser SAML/SSO login (CLI + NetworkManager plugin)'
+arch=(x86_64 aarch64)
+url='https://github.com/flokol120/fuckforti'
+license=(MIT)
+makedepends=(cargo cmake qt6-base)
+source=("$pkgbase-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+# Fill in after tagging the release: updpkgsums
+sha256sums=('SKIP')
+
+prepare() {
+  cd "$pkgbase-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$pkgbase-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release
+
+  cmake -S plasma -B build-plasma -DCMAKE_BUILD_TYPE=None -DCMAKE_INSTALL_PREFIX=/usr -Wno-dev
+  cmake --build build-plasma
+}
+
+check() {
+  cd "$pkgbase-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo test --frozen
+}
+
+package_fuckforti() {
+  pkgdesc='FortiGate IKEv2 IPsec VPN client with browser SAML/SSO login (CLI + NetworkManager plugin)'
+  depends=(gcc-libs glibc openssl strongswan networkmanager iproute2 systemd xdg-utils)
+  optdepends=('fuckforti-plasma: connect from the KDE Plasma network applet')
+  install=fuckforti.install
+
+  cd "$pkgbase-$pkgver"
+  install -Dm755 target/release/fuckforti -t "$pkgdir/usr/bin"
+  install -Dm755 target/release/nm-fuckforti-service -t "$pkgdir/usr/lib/fuckforti"
+  install -Dm644 nm/nm-fuckforti-service.name -t "$pkgdir/usr/lib/NetworkManager/VPN"
+  install -Dm644 nm/nm-fuckforti-service.conf -t "$pkgdir/usr/share/dbus-1/system.d"
+  install -Dm644 README.md config.example.toml -t "$pkgdir/usr/share/doc/$pkgname"
+  install -Dm644 LICENSE -t "$pkgdir/usr/share/licenses/$pkgname"
+}
+
+package_fuckforti-plasma() {
+  pkgdesc='KDE Plasma network applet support for fuckforti VPN connections'
+  depends=(fuckforti plasma-nm qt6-base gcc-libs glibc)
+
+  cd "$pkgbase-$pkgver"
+  DESTDIR="$pkgdir" cmake --install build-plasma
+  install -Dm644 LICENSE -t "$pkgdir/usr/share/licenses/$pkgname"
+}

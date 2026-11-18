@@ -41,6 +41,11 @@ sudo install -Dm644 nm/nm-fuckforti-service.name /usr/lib/NetworkManager/VPN/nm-
 sudo install -Dm644 nm/nm-fuckforti-service.conf /usr/share/dbus-1/system.d/nm-fuckforti-service.conf
 sudo systemctl restart NetworkManager
 
+# KDE Plasma only: the tray refuses VPN types without a plasma-nm plugin.
+# This metadata-only stub enables connecting from the tray (needs cmake + qt6-base).
+cmake -S plasma -B target/plasma -DCMAKE_INSTALL_PREFIX=/usr && cmake --build target/plasma
+sudo cmake --install target/plasma
+
 nmcli connection add type vpn con-name forti ifname '*' \
   vpn-type org.freedesktop.NetworkManager.fuckforti vpn.timeout 300 \
   vpn.data 'gateway=vpn.example.com, saml_port=9443, ike_port=4500, local_id=MY-LOCAL-ID, split_routes=10.0.0.0/8, dns_domains=corp.example.com' \
