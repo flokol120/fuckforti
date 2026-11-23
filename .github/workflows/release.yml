@@ -1,0 +1,53 @@
+name: release
+
+# Build portable, statically linked (musl + vendored OpenSSL) binaries and
+# attach them to the GitHub Release when a v* tag is pushed. Distro packages
+# (AUR) build separately and stay dynamically linked against system libraries.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Build (static, vendored OpenSSL)
+        run: >
+          cargo build --release --locked
+          --features vendored-tls
+          --target x86_64-unknown-linux-musl
+
+      - name: Package
+        run: |
+          set -eu
+          V="${GITHUB_REF_NAME}"
+          D="fuckforti-${V}-x86_64-linux-musl"
+          BIN="target/x86_64-unknown-linux-musl/release"
+          mkdir "$D"
+          cp "$BIN/fuckforti" "$BIN/nm-fuckforti-service" \
+             README.md LICENSE config.example.toml "$D/"
+          tar czf "$D.tar.gz" "$D"
+          sha256sum "$D.tar.gz" > "$D.tar.gz.sha256"
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            fuckforti-*-x86_64-linux-musl.tar.gz
+            fuckforti-*-x86_64-linux-musl.tar.gz.sha256

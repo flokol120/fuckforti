@@ -15,6 +15,12 @@ signal-hook = "0.3"
 toml = "0.8"
 zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"] }
 
+[features]
+# Statically link OpenSSL into the binary (built from source). Off by default so
+# distro builds (e.g. the AUR package) link dynamically against system OpenSSL.
+# Used by the release workflow for portable musl-static binaries.
+vendored-tls = ["native-tls/vendored"]
+
 [profile.release]
 lto = true
 strip = true
