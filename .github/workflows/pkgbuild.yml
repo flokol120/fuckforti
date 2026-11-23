@@ -1,0 +1,46 @@
+name: pkgbuild
+
+# Build the Arch package from packaging/arch/PKGBUILD against the current
+# checkout, so a broken PKGBUILD shows up before it reaches the AUR. The
+# PKGBUILD downloads a tagged release; here the source is swapped for the
+# checked-out tree, so the checksum is not verified (that's what updpkgsums is
+# for at release time).
+
+on:
+  push:
+    branches: [main]
+    paths: ['packaging/arch/**', 'src/**', 'nm/**', 'plasma/**', 'Cargo.*', '.github/workflows/pkgbuild.yml']
+  pull_request:
+    paths: ['packaging/arch/**', 'src/**', 'nm/**', 'plasma/**', 'Cargo.*', '.github/workflows/pkgbuild.yml']
+  workflow_dispatch:
+
+jobs:
+  makepkg:
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - name: Install build tools
+        run: |
+          pacman -Syu --noconfirm --needed base-devel git rust cmake qt6-base
+          useradd -m builder
+
+      - uses: actions/checkout@v4
+
+      - name: Prepare source from checkout
+        run: |
+          set -eu
+          pkgver=$(sed -n 's/^pkgver=//p' packaging/arch/PKGBUILD)
+          W=/home/builder/pkg
+          mkdir -p "$W"
+          cp packaging/arch/PKGBUILD packaging/arch/fuckforti.install "$W/"
+          # Same layout and name as the GitHub tag tarball the PKGBUILD expects.
+          git config --global --add safe.directory "$PWD"
+          git archive --format=tar.gz --prefix="fuckforti-$pkgver/" HEAD > "$W/fuckforti-$pkgver.tar.gz"
+          chown -R builder: "$W"
+
+      - name: makepkg
+        working-directory: /home/builder/pkg
+        run: |
+          su builder -c 'makepkg --skipchecksums --nodeps --noconfirm'
+          su builder -c 'makepkg --printsrcinfo' > /dev/null
+          ls -l ./*.pkg.tar.zst

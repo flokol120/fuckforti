@@ -8,7 +8,8 @@ and leaves IKEv2/ESP to strongSwan.
 
 ## Quick start (prebuilt binary)
 The [releases](https://github.com/flokol120/fuckforti/releases) have statically linked
-x86_64 binaries that run on any distribution.
+x86_64 binaries that run on any distribution. On Arch, use the
+[package](#arch-linux-package) instead.
 
 **1. Install strongSwan** (plus iproute2 and a running systemd-resolved, which most
 desktops already have):
@@ -49,6 +50,21 @@ Ctrl-C to disconnect, which removes the interface, routes and DNS again.
 
 The archive also contains the NetworkManager plugin (`nm-fuckforti-service` and the
 `nm/` files); see [NetworkManager plugin](#networkmanager-plugin) to install it.
+
+## Arch Linux package
+An AUR package is planned. Until then, build it from the `PKGBUILD` in this repo. It
+links against the system OpenSSL and installs the CLI, the NetworkManager plugin and
+(optionally) the KDE Plasma stub:
+```sh
+git clone https://github.com/flokol120/fuckforti
+cd fuckforti/packaging/arch
+makepkg -s                                    # builds both packages
+sudo pacman -U fuckforti-[0-9]*.pkg.tar.zst
+sudo pacman -U fuckforti-plasma-*.pkg.tar.zst # KDE Plasma only
+```
+Then configure it as in steps 3–4 above, or set up a NetworkManager connection
+([below](#networkmanager-plugin); the plugin files are already installed, so skip the
+install commands there).
 
 ## How it works
 1. `POST https://<gw>:<sso_port>/saml_login?` with a client-generated `UID` → the FortiGate returns the SAML login URL.
