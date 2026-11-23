@@ -19,13 +19,39 @@ use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::vici::{Msg, Session};
 
-const CHARON: &str = "/usr/lib/strongswan/charon";
+/// Where distros install the charon daemon (Arch, Debian/Ubuntu, Fedora/RHEL,
+/// openSUSE, source builds with the default prefix).
+const CHARON_PATHS: &[&str] = &[
+    "/usr/lib/strongswan/charon",
+    "/usr/lib/ipsec/charon",
+    "/usr/libexec/strongswan/charon",
+    "/usr/libexec/ipsec/charon",
+    "/usr/local/libexec/ipsec/charon",
+];
 const CONN: &str = "forti";
 const PSK_ID: &str = "fuckforti-psk";
 const EAP_ID: &str = "fuckforti-eap";
 
 const PLUGINS: &str = "random nonce openssl pem pkcs1 pkcs8 x509 revocation constraints pubkey kdf \
 kernel-netlink socket-default vici resolve eap-identity eap-mschapv2 eap-gtc eap-md5";
+
+/// A gateway listening on anything but 500 expects IKE from charon's NAT-T
+/// socket (4500, with the non-ESP marker). strongSwan 6 floats there on its own,
+/// 5.9 (Debian/Ubuntu/Fedora) would send from 500 and get no answer.
+fn local_port(ike_port: u16) -> u16 {
+    if ike_port == 500 {
+        500
+    } else {
+        4500
+    }
+}
+
+fn find_charon() -> Result<&'static str> {
+    match CHARON_PATHS.iter().find(|p| Path::new(p).is_file()) {
+        Some(p) => Ok(p),
+        None => cerr(format!("strongSwan charon not found (looked in {})", CHARON_PATHS.join(", "))),
+    }
+}
 
 fn cerr<T>(msg: impl Into<String>) -> Result<T> {
     Err(Error::Charon(msg.into()))
@@ -110,6 +136,7 @@ pub fn connection(cfg: &Config, eap_id: &str) -> Msg {
         .kv("version", "2")
         .list("remote_addrs", [&cfg.gateway])
         .kv("remote_port", cfg.ike_port.to_string())
+        .kv("local_port", local_port(cfg.ike_port).to_string())
         .list("proposals", &cfg.ike_proposals)
         .list("vips", ["0.0.0.0"])
         .kv("encap", yes_no(cfg.force_encap))
@@ -195,7 +222,8 @@ impl<'a> Charon<'a> {
         let rundir = self.conf_path.parent().unwrap();
         fs::write(&self.conf_path, strongswan_conf(self.cfg, rundir, self.debug, self.dns_file.as_deref()))
             .or_else(|e| cerr(format!("cannot write {}: {e}", self.conf_path.display())))?;
-        let mut cmd = Command::new(CHARON);
+        let charon = find_charon()?;
+        let mut cmd = Command::new(charon);
         cmd.env_clear()
             .env("PATH", "/usr/bin:/bin")
             .env("STRONGSWAN_CONF", &self.conf_path)
@@ -209,7 +237,7 @@ impl<'a> Charon<'a> {
                 Ok(())
             });
         }
-        let child = cmd.spawn().or_else(|e| cerr(format!("cannot start {CHARON}: {e}")))?;
+        let child = cmd.spawn().or_else(|e| cerr(format!("cannot start {charon}: {e}")))?;
         let child = self.child.insert(child);
         for _ in 0..100 {
             if let Ok(Some(st)) = child.try_wait() {
@@ -390,11 +418,19 @@ mod tests {
     use crate::config::tests::base;
 
     #[test]
+    fn local_port_follows_gateway() {
+        assert_eq!(local_port(500), 500);
+        assert_eq!(local_port(4500), 4500);
+        assert_eq!(local_port(10500), 4500);
+    }
+
+    #[test]
     fn conn() {
         let c = base();
         let m = connection(&c, "UID");
         let conn = m.section("forti").unwrap();
         assert_eq!(conn.str("remote_port"), Some(&b"4500"[..]));
+        assert_eq!(conn.str("local_port"), Some(&b"4500"[..]));
         let local = conn.section("local").unwrap();
         assert_eq!(*local, Msg::new().kv("auth", "eap").kv("id", "ID").kv("eap_id", "UID"));
         let child = conn.section("children").unwrap().section("forti").unwrap();

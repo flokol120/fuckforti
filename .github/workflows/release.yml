@@ -39,9 +39,10 @@ jobs:
           V="${GITHUB_REF_NAME}"
           D="fuckforti-${V}-x86_64-linux-musl"
           BIN="target/x86_64-unknown-linux-musl/release"
-          mkdir "$D"
+          mkdir -p "$D/nm"
           cp "$BIN/fuckforti" "$BIN/nm-fuckforti-service" \
              README.md LICENSE config.example.toml "$D/"
+          cp nm/nm-fuckforti-service.name nm/nm-fuckforti-service.conf "$D/nm/"
           tar czf "$D.tar.gz" "$D"
           sha256sum "$D.tar.gz" > "$D.tar.gz.sha256"
 

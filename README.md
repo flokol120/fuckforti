@@ -6,6 +6,50 @@ Fortinet ships no Linux client for it and the SSL VPN is going away.
 An openfortivpn-style client: it handles the Fortinet-specific SAML handshake itself
 and leaves IKEv2/ESP to strongSwan.
 
+## Quick start (prebuilt binary)
+The [releases](https://github.com/flokol120/fuckforti/releases) have statically linked
+x86_64 binaries that run on any distribution.
+
+**1. Install strongSwan** (plus iproute2 and a running systemd-resolved, which most
+desktops already have):
+
+| Distribution | Command |
+|---|---|
+| Arch, Manjaro | `sudo pacman -S strongswan` |
+| Debian, Ubuntu, Mint | `sudo apt install strongswan-charon strongswan-swanctl libstrongswan-standard-plugins libcharon-extra-plugins libcharon-extauth-plugins` |
+| Fedora | `sudo dnf install strongswan` |
+
+fuckforti starts its own private `charon`. If the system `strongswan` service is
+running, stop it first (`sudo systemctl disable --now strongswan`).
+
+**2. Download and install:**
+```sh
+V=v0.2.0
+curl -LO https://github.com/flokol120/fuckforti/releases/download/$V/fuckforti-$V-x86_64-linux-musl.tar.gz
+curl -LO https://github.com/flokol120/fuckforti/releases/download/$V/fuckforti-$V-x86_64-linux-musl.tar.gz.sha256
+sha256sum -c fuckforti-$V-x86_64-linux-musl.tar.gz.sha256
+tar xzf fuckforti-$V-x86_64-linux-musl.tar.gz && cd fuckforti-$V-x86_64-linux-musl
+sudo install -m755 fuckforti /usr/local/bin/
+```
+
+**3. Configure:** copy the example config and fill in the values from your FortiClient
+VPN profile (gateway, SSO port, local ID, proposals, routes, DNS domains):
+```sh
+sudo install -Dm600 config.example.toml /etc/fuckforti/config.toml
+sudoedit /etc/fuckforti/config.toml
+sudo sh -c 'umask 077; cat > /etc/fuckforti/psk'   # paste the pre-shared key, then Ctrl-D
+```
+
+**4. Connect:**
+```sh
+sudo fuckforti        # reads /etc/fuckforti/config.toml; -v for verbose IKE logs
+```
+Your browser opens for the SSO login. After it completes the tunnel comes up; press
+Ctrl-C to disconnect, which removes the interface, routes and DNS again.
+
+The archive also contains the NetworkManager plugin (`nm-fuckforti-service` and the
+`nm/` files); see [NetworkManager plugin](#networkmanager-plugin) to install it.
+
 ## How it works
 1. `POST https://<gw>:<sso_port>/saml_login?` with a client-generated `UID` → the FortiGate returns the SAML login URL.
 2. Your browser logs in (IdP, MFA, …). The FortiGate then redirects to `http://127.0.0.1:8020/?tokenid=…&username=…`.
@@ -17,7 +61,7 @@ strongSwan ≥ 5.9 (with `charon` and the eap-mschapv2/eap-gtc/eap-md5/eap-ident
 Building needs a Rust toolchain (1.80+).
 The system `strongswan` service must not be running.
 
-## Build & usage
+## Building from source
 ```sh
 cargo build --release
 sudo install -m755 target/release/fuckforti /usr/local/bin/
@@ -33,6 +77,10 @@ Plasma/GNOME network applet or with `nmcli`. When you connect, the service opens
 SAML login in the browser of the active desktop session. NetworkManager then applies
 the address, routes and DNS. There is no settings GUI yet, so create the connection once
 with `nmcli`.
+
+From the release archive, run these from the unpacked directory and use
+`nm-fuckforti-service` instead of `target/release/nm-fuckforti-service`. The Plasma
+stub isn't in the archive, so build it from source.
 
 ```sh
 cargo build --release
