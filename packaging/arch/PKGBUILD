@@ -9,8 +9,7 @@ url='https://github.com/flokol120/fuckforti'
 license=(MIT)
 makedepends=(cargo cmake qt6-base)
 source=("$pkgbase-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-# Fill in after tagging the release: updpkgsums
-sha256sums=('SKIP')
+sha256sums=('5cb0524affa540306c5b5938b0bbdb3e4b4c31f19c64ba92573937b80f50439c')
 
 prepare() {
   cd "$pkgbase-$pkgver"
