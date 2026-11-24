@@ -1,12 +1,16 @@
 //! A private strongSwan charon instance, driven over VICI.
 //!
 //! The instance installs no routes, policies only match traffic on our XFRM
-//! interface (if_id), and DNS servers from mode-config are handed to
-//! systemd-resolved for that interface via the resolve plugin (or, under
-//! NetworkManager, written to a file that the service reports to NM).
+//! interface (if_id), and DNS servers from mode-config are collected in a
+//! file that the front-end hands on (to systemd-resolved, or to NetworkManager).
+//!
+//! All files charon itself touches live at `/run/charon.fuckforti.*`: the
+//! AppArmor profile Debian/Ubuntu/Mint ship for charon grants it `/run/charon.*`
+//! but nothing under our own run directory.
 
 use std::fs;
 use std::net::Ipv4Addr;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -28,6 +32,10 @@ const CHARON_PATHS: &[&str] = &[
     "/usr/libexec/ipsec/charon",
     "/usr/local/libexec/ipsec/charon",
 ];
+/// Prefix of the files of our charon instance (see the module docs).
+const FILES: &str = "/run/charon.fuckforti";
+/// VICI socket of our charon instance.
+pub const VICI_SOCKET: &str = "/run/charon.fuckforti.vici";
 const CONN: &str = "forti";
 const PSK_ID: &str = "fuckforti-psk";
 const EAP_ID: &str = "fuckforti-eap";
@@ -57,20 +65,10 @@ fn cerr<T>(msg: impl Into<String>) -> Result<T> {
     Err(Error::Charon(msg.into()))
 }
 
-/// `dns_file`: write received DNS servers to this file instead of calling resolvconf.
-pub fn strongswan_conf(cfg: &Config, rundir: &Path, debug: bool, dns_file: Option<&Path>) -> String {
+/// `files`: path prefix of the config, socket, log and DNS file.
+pub fn strongswan_conf(cfg: &Config, files: &str, debug: bool) -> String {
     let lvl = if debug { 2 } else { 1 };
     let enc = if debug { 1 } else { 0 };
-    let resolve = match dns_file {
-        // charon runs `<path> -a|-d <iface>` and feeds "nameserver X" lines on stdin
-        // for every server; record the added ones instead of touching resolved.
-        Some(f) => format!(
-            "resolvconf {{\n                path = \"/bin/sh -c 'if [ $1 = -a ]; then cat >> {}; else cat >/dev/null; fi' fuckforti-dns\"\n            }}",
-            f.display()
-        ),
-        None => format!("resolvconf {{\n                iface = {}\n            }}", cfg.ifname),
-    };
-    let rundir = rundir.display();
     let tries = cfg.retransmit_tries;
     let ifname = &cfg.ifname;
     format!(
@@ -84,15 +82,21 @@ charon {{
     interfaces_ignore = {ifname}
     plugins {{
         vici {{
-            socket = unix://{rundir}/charon.vici
+            socket = unix://{files}.vici
         }}
+        # charon runs `<path> -a|-d <iface>` with "nameserver X" lines on stdin;
+        # record the added servers instead of touching the system resolver.
+        # Without resolvconf.path support it writes `file` directly instead.
         resolve {{
-            {resolve}
+            file = {files}.dns
+            resolvconf {{
+                path = "/bin/sh -c 'if [ $1 = -a ]; then cat >> {files}.dns; else cat >/dev/null; fi' fuckforti-dns"
+            }}
         }}
     }}
     filelog {{
         ofi {{
-            path = {rundir}/charon.log
+            path = {files}.log
             time_format = %H:%M:%S
             default = 1
             ike = {lvl}
@@ -162,7 +166,7 @@ pub struct Charon<'a> {
     sock_path: PathBuf,
     conf_path: PathBuf,
     pub log_path: PathBuf,
-    dns_file: Option<PathBuf>,
+    dns_path: PathBuf,
 }
 
 /// IPv4 `nameserver` entries of a resolv.conf-style file.
@@ -182,29 +186,34 @@ pub fn parse_nameservers(text: &str) -> Vec<Ipv4Addr> {
 }
 
 impl<'a> Charon<'a> {
-    pub fn new(cfg: &'a Config, rundir: &Path, debug: bool, stop: Arc<AtomicBool>) -> Self {
+    pub fn new(cfg: &'a Config, debug: bool, stop: Arc<AtomicBool>) -> Self {
         Charon {
             cfg,
             debug,
             child: None,
             stop,
-            sock_path: rundir.join("charon.vici"),
-            conf_path: rundir.join("strongswan.conf"),
-            log_path: rundir.join("charon.log"),
-            dns_file: None,
+            sock_path: VICI_SOCKET.into(),
+            conf_path: format!("{FILES}.conf").into(),
+            log_path: format!("{FILES}.log").into(),
+            dns_path: format!("{FILES}.dns").into(),
         }
     }
 
-    /// Collect DNS servers in `path` instead of configuring systemd-resolved.
-    pub fn with_dns_file(mut self, path: PathBuf) -> Self {
-        self.dns_file = Some(path);
-        self
+    /// DNS servers received from the gateway.
+    pub fn dns_servers(&self) -> Vec<Ipv4Addr> {
+        fs::read_to_string(&self.dns_path).map(|t| parse_nameservers(&t)).unwrap_or_default()
     }
 
-    /// DNS servers received from the gateway (only with `with_dns_file`).
-    pub fn dns_servers(&self) -> Vec<Ipv4Addr> {
-        let Some(p) = &self.dns_file else { return Vec::new() };
-        fs::read_to_string(p).map(|t| parse_nameservers(&t)).unwrap_or_default()
+    /// Remove the instance's files (after `stop`).
+    pub fn remove_files(&self) {
+        for p in [&self.conf_path, &self.sock_path, &self.log_path, &self.dns_path] {
+            let _ = fs::remove_file(p);
+        }
+    }
+
+    /// Empty DNS file, so servers of an earlier SA are not reported again.
+    fn reset_dns(&self) {
+        let _ = fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&self.dns_path);
     }
 
     pub fn started(&self) -> bool {
@@ -219,8 +228,9 @@ impl<'a> Charon<'a> {
                 "another charon is running (strongswan.service?). Stop it first: sudo systemctl stop strongswan",
             );
         }
-        let rundir = self.conf_path.parent().unwrap();
-        fs::write(&self.conf_path, strongswan_conf(self.cfg, rundir, self.debug, self.dns_file.as_deref()))
+        let _ = fs::remove_file(&self.sock_path); // stale, from a crashed session
+        self.reset_dns();
+        fs::write(&self.conf_path, strongswan_conf(self.cfg, FILES, self.debug))
             .or_else(|e| cerr(format!("cannot write {}: {e}", self.conf_path.display())))?;
         let charon = find_charon()?;
         let mut cmd = Command::new(charon);
@@ -318,9 +328,7 @@ impl<'a> Charon<'a> {
     /// Bring the SA up again with the credentials charon still holds (no new
     /// SAML login). Returns the virtual IP; on failure the attempt is aborted.
     pub fn reinitiate(&self) -> Result<String> {
-        if let Some(p) = &self.dns_file {
-            let _ = fs::remove_file(p); // charon re-reports the servers of the new SA
-        }
+        self.reset_dns(); // charon re-reports the servers of the new SA
         let res = self.initiate(|m| println!("{m}")).and_then(|()| self.virtual_ip());
         if res.is_err() {
             self.terminate(); // initiate may time out while charon keeps retrying
@@ -444,15 +452,14 @@ mod tests {
     #[test]
     fn conf_has_no_secret() {
         let c = base();
-        let conf = strongswan_conf(&c, Path::new("/run/x"), false, None);
-        assert!(conf.contains("socket = unix:///run/x/charon.vici"));
-        assert!(conf.contains("iface = forti0"));
+        let conf = strongswan_conf(&c, "/run/x", false);
+        assert!(conf.contains("socket = unix:///run/x.vici"));
+        assert!(conf.contains("path = /run/x.log"));
         assert!(conf.contains("retransmit_tries = 5"));
         assert!(conf.contains("interfaces_ignore = forti0"));
         assert!(!conf.split_whitespace().any(|t| t == "k"));
-        let conf = strongswan_conf(&c, Path::new("/run/x"), false, Some(Path::new("/run/x/dns.conf")));
-        assert!(conf.contains("cat >> /run/x/dns.conf"));
-        assert!(!conf.contains("iface"));
+        assert!(conf.contains("cat >> /run/x.dns"));
+        assert!(conf.contains("file = /run/x.dns"));
     }
 
     #[test]
