@@ -77,6 +77,11 @@ strongSwan ≥ 5.9 (with `charon` and the eap-mschapv2/eap-gtc/eap-md5/eap-ident
 Building needs a Rust toolchain (1.80+).
 The system `strongswan` service must not be running.
 
+The private `charon` keeps its config, VICI socket, log and received DNS servers in
+`/run/charon.fuckforti.*`, which the AppArmor profile that Debian, Ubuntu and Mint ship
+for charon already allows, so it can stay in enforce mode. It does not need a
+`resolvconf` command; fuckforti sets the DNS servers itself with `resolvectl`.
+
 ## Building from source
 ```sh
 cargo build --release

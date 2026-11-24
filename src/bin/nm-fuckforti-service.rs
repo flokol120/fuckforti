@@ -234,13 +234,13 @@ fn degrade(sh: &Shared, cfg: &Config) {
 fn session(sh: Arc<Shared>, cfg: Config, persistent: bool) {
     let rundir = Path::new(RUNDIR);
     let lock = lock_rundir(rundir);
-    let mut charon = Charon::new(&cfg, rundir, false, sh.stop.clone()).with_dns_file(rundir.join("dns.conf"));
+    let mut charon = Charon::new(&cfg, false, sh.stop.clone());
     let mut tunnel: Option<Tunnel> = None;
     let mut was_up = false;
     let mut retry = Retry::new();
     let result = match &lock {
         Ok(_) => {
-            let _ = std::fs::remove_file(&charon.log_path);
+            charon.remove_files(); // left over from a crashed session
             loop {
                 let mut up = false;
                 let res = bring_up(&sh, &cfg, &mut charon, &mut tunnel, &mut up);
@@ -304,6 +304,7 @@ fn session(sh: Arc<Shared>, cfg: Config, persistent: bool) {
     sh.set_state(STATE_STOPPING);
     shutdown(&mut charon, tunnel.as_mut());
     if lock.is_ok() {
+        charon.remove_files();
         let _ = std::fs::remove_dir_all(rundir);
     }
     sh.set_state(STATE_STOPPED);

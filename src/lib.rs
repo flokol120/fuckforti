@@ -21,7 +21,8 @@ use charon::Charon;
 use error::{Error, Result};
 use net::Tunnel;
 
-/// Runtime directory of a session (charon config, VICI socket, log, lock).
+/// Runtime directory of a session (lock). charon's own files are elsewhere,
+/// see `charon::VICI_SOCKET`.
 pub const RUNDIR: &str = "/run/fuckforti";
 
 /// Create the run directory and take an exclusive lock on it for this process.
@@ -30,9 +31,12 @@ pub fn lock_rundir(rundir: &Path) -> std::result::Result<fs::File, String> {
     match fs::DirBuilder::new().mode(0o700).create(rundir) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            // A live charon socket means another session (possibly an older version) owns it.
-            if std::os::unix::net::UnixStream::connect(rundir.join("charon.vici")).is_ok() {
-                return Err(format!("another session is running ({shown}/charon.vici is live)"));
+            // A live charon socket means another session (possibly an older
+            // version, which kept it in the run directory) owns it.
+            for sock in [Path::new(charon::VICI_SOCKET).to_path_buf(), rundir.join("charon.vici")] {
+                if std::os::unix::net::UnixStream::connect(&sock).is_ok() {
+                    return Err(format!("another session is running ({} is live)", sock.display()));
+                }
             }
         }
         Err(e) => return Err(format!("cannot create {shown}: {e}")),

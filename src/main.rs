@@ -113,11 +113,13 @@ fn connect<'a>(
     let mut vip = charon.virtual_ip()?;
     interrupted(stop)?;
     let routes = t.configure(&vip)?;
+    let dns = charon.dns_servers();
+    t.set_dns_servers(&dns);
     *up = true;
     println!("Tunnel up: {} {vip}", cfg.ifname);
     let note = if cfg.full_tunnel() { "  (full tunnel, local LAN excluded)" } else { "" };
     println!("  routes: {}{note}", routes.join(", "));
-    let dns = t.dns_servers();
+    let dns: Vec<String> = dns.iter().map(ToString::to_string).collect();
     println!("  dns:    {}", if dns.is_empty() { "(none pushed)".to_string() } else { dns.join(", ") });
     println!("Press Ctrl-C to disconnect.");
     monitor(charon, |w| match w {
@@ -125,13 +127,15 @@ fn connect<'a>(
             t.refresh_host_route();
             Ok(())
         }
-        Watch::Restored { vip: new, .. } if new != vip => {
-            println!("New virtual IP {new}");
-            t.configure(new)?;
-            vip = new.to_string();
+        Watch::Restored { vip: new, dns } => {
+            if new != vip {
+                println!("New virtual IP {new}");
+                t.configure(new)?;
+                vip = new.to_string();
+            }
+            t.set_dns_servers(&dns);
             Ok(())
         }
-        Watch::Restored { .. } => Ok(()),
     })
 }
 
@@ -179,8 +183,8 @@ fn run() -> u8 {
         }
     };
 
-    let mut charon = Charon::new(&cfg, rundir, args.verbose, stop.clone());
-    let _ = fs::remove_file(&charon.log_path); // left over from a crashed session
+    let mut charon = Charon::new(&cfg, args.verbose, stop.clone());
+    charon.remove_files(); // left over from a crashed session
     let mut tunnel: Option<Tunnel> = None;
     let mut ran_charon = false;
     let mut was_up = false; // reconnect only sessions that worked once
@@ -237,6 +241,7 @@ fn run() -> u8 {
     if args.verbose && ran_charon && fs::copy(&charon.log_path, KEPT_LOG).is_ok() {
         println!("charon log kept at {KEPT_LOG}");
     }
+    charon.remove_files();
     let _ = fs::remove_dir_all(rundir);
     rc
 }

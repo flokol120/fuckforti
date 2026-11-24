@@ -194,11 +194,13 @@ impl<'a> Tunnel<'a> {
         }
     }
 
-    pub fn dns_servers(&self) -> Vec<String> {
-        let out = run(&["resolvectl", "dns", &self.cfg.ifname], false).map(|o| o.stdout).unwrap_or_default();
-        match out.split_once(':') {
-            Some((_, rest)) => rest.split_whitespace().map(String::from).collect(),
-            None => Vec::new(),
+    /// Hand the DNS servers pushed by the gateway to systemd-resolved for our link.
+    pub fn set_dns_servers(&self, servers: &[Ipv4Addr]) {
+        let servers: Vec<String> = servers.iter().map(ToString::to_string).collect();
+        let mut args = vec!["resolvectl", "dns", self.cfg.ifname.as_str()];
+        args.extend(servers.iter().map(String::as_str));
+        if let Err(e) = run(&args, true) {
+            println!("warning: cannot set DNS servers: {e}");
         }
     }
 
